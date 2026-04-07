@@ -42,28 +42,24 @@ With RN 0.83, the default `RCT_USE_PREBUILT_RNCORE=1` introduces the `React-Core
 
 Since Firebase requires `use_frameworks! :linkage => :static` for its Swift pods, every project using `@react-native-firebase` on RN 0.83+ hits this incompatibility.
 
-### Workarounds Attempted
+### Workaround — Error 1 SOLVED (local Xcode build)
 
-A custom Expo config plugin (`plugins/with-rnfb-fix.js`) applies three `post_install` patches:
+A custom Expo config plugin (`plugins/with-rnfb-fix.js`) applies two `post_install` patches that **fully resolve Error 1** for local Release builds:
 
-1. **Strip modulemap references** — removes `-fmodule-map-file="...React-use-frameworks.modulemap"` from all xcconfig files
-2. **Recreate the modulemap** — injects a shell script into the `React-Core-prebuilt` build phase to generate the missing modulemap after tarball extraction
-3. **Fix HERMES_CLI_PATH** — replaces the absolute path with `$(PODS_ROOT)/../node_modules/hermes-compiler/hermesc/osx-bin/hermesc`
+1. **Recreate the modulemap** — injects a shell script into the `React-Core-prebuilt` build phase to generate the missing `React-use-frameworks.modulemap` after tarball extraction
+2. **Allow non-modular includes** — sets `CLANG_ALLOW_NON_MODULAR_INCLUDES_IN_FRAMEWORK_MODULES=YES` and `-Wno-non-modular-include-in-framework-module` for all RNFB pod targets
 
-**Result:** The workaround partially fixes Error 1 locally, but Error 2 persists on EAS because the absolute `HERMES_CLI_PATH` seems to be resolved before the Podfile `post_install` hook runs, or the value is cached elsewhere in the build system.
+After removing an earlier HERMES_CLI_PATH patch (which was interfering), the **local Xcode Release build succeeds**.
 
-<details><summary>Plugin code (plugins/with-rnfb-fix.js)</summary>
+<details><summary>Current plugin code (plugins/with-rnfb-fix.js)</summary>
 <p>
 
 ```js
-const { withDangerousMod, createRunOncePlugin } = require("@expo/config-plugins");
+const {withDangerousMod, createRunOncePlugin} = require("@expo/config-plugins");
 const fs = require("fs");
 const path = require("path");
 
-const RNFB_TARGETS = [
-    "RNFBApp", "RNFBAuth", "RNFBAnalytics",
-    "RNFBCrashlytics", "RNFBMessaging", "RNFBRemoteConfig",
-];
+const RNFB_TARGETS = ["RNFBApp", "RNFBAuth", "RNFBAnalytics", "RNFBCrashlytics", "RNFBMessaging", "RNFBRemoteConfig"];
 
 const POST_INSTALL_SNIPPET = `
     # [with-rnfb-fix] Patch React-Core-prebuilt replace script to recreate modulemap
@@ -88,24 +84,6 @@ echo "[with-rnfb-fix] Created React-use-frameworks.modulemap"
       end
     end
 
-    # [with-rnfb-fix] Fix HERMES_CLI_PATH to use relative path
-    installer.pods_project.targets.each do |t|
-      if t.name == 'hermes-engine'
-        t.build_configurations.each do |config|
-          config.build_settings.delete('HERMES_CLI_PATH')
-        end
-      end
-    end
-    installer.aggregate_targets.each do |t|
-      t.xcconfigs.each do |config_name, config|
-        if config.attributes['HERMES_CLI_PATH']
-          config.attributes['HERMES_CLI_PATH'] = '$(PODS_ROOT)/../node_modules/hermes-compiler/hermesc/osx-bin/hermesc'
-          xcconfig_path = t.xcconfig_path(config_name)
-          config.save_as(xcconfig_path)
-        end
-      end
-    end
-
     # [with-rnfb-fix] Allow non-modular includes for Firebase pods
     installer.pods_project.targets.each do |t|
       if ${JSON.stringify(RNFB_TARGETS)}.include?(t.name)
@@ -122,8 +100,7 @@ function injectSnippets(podfile) {
     if (podfile.includes("[with-rnfb-fix]")) return podfile;
     return podfile.replace(
         /post_install do \|installer\|([\s\S]*?)(\n\s*end\s*$)/m,
-        (_match, body, ending) =>
-            `post_install do |installer|${body}\n${POST_INSTALL_SNIPPET}${ending}`
+        (_match, body, ending) => `post_install do |installer|${body}\n${POST_INSTALL_SNIPPET}${ending}`,
     );
 }
 
@@ -145,9 +122,18 @@ module.exports = createRunOncePlugin(withRNFBFix, "with-rnfb-fix", "1.0.0");
 </p>
 </details>
 
+### Error 2 — STILL FAILING on EAS Build
+
+The EAS build still fails because `HERMES_CLI_PATH` is baked as an absolute local machine path during `pod install`. The `react-native-xcode.sh` script tries to invoke `hermesc` at a path like `/Volumes/DiscoD/Projects/.../hermesc` which doesn't exist on the EAS build server.
+
+This is **not specific to react-native-firebase** — it affects any Expo SDK 55 + RN 0.83 project using `use_frameworks: :static` on EAS Build. The `HERMES_CLI_PATH` is resolved to an absolute path by the React Native CocoaPods setup and there is no hook available to override it before the value is written to the xcconfig files that get uploaded to EAS.
+
+A previous attempt to patch `HERMES_CLI_PATH` in `post_install` was removed because it interfered with local builds. The absolute path appears to be set somewhere outside the Podfile's control (possibly in the hermes-engine podspec or React Native's `react_native_pods.rb` script).
+
 ### Suggested Fix
 
 The RNFB Expo config plugin could:
+
 1. Automatically strip or fix `React-use-frameworks.modulemap` references when `use_frameworks: :static` is active
 2. Ensure `HERMES_CLI_PATH` uses a relative/variable-based path (`$(PODS_ROOT)/...`) instead of an absolute path
 3. Or recommend setting `RCT_USE_PREBUILT_RNCORE=0` as a documented workaround for RN 0.83+
@@ -171,55 +157,55 @@ The RNFB Expo config plugin could:
 
 ```json
 {
-  "name": "expo-testbuild",
-  "main": "expo-router/entry",
-  "version": "1.0.0",
-  "scripts": {
-    "start": "expo start",
-    "android": "expo run:android",
-    "ios": "expo run:ios"
-  },
-  "dependencies": {
-    "@react-native-firebase/analytics": "^24.0.0",
-    "@react-native-firebase/auth": "^24.0.0",
-    "@react-native-firebase/crashlytics": "^24.0.0",
-    "@react-native-firebase/firestore": "^24.0.0",
-    "@react-native-firebase/messaging": "^24.0.0",
-    "@react-native-firebase/remote-config": "^24.0.0",
-    "@react-navigation/bottom-tabs": "^7.15.5",
-    "@react-navigation/elements": "^2.9.10",
-    "@react-navigation/native": "^7.1.33",
-    "expo": "~55.0.11",
-    "expo-build-properties": "~55.0.11",
-    "expo-constants": "~55.0.11",
-    "expo-dev-client": "~55.0.22",
-    "expo-device": "~55.0.12",
-    "expo-font": "~55.0.6",
-    "expo-glass-effect": "~55.0.10",
-    "expo-image": "~55.0.8",
-    "expo-linking": "~55.0.11",
-    "expo-router": "~55.0.10",
-    "expo-splash-screen": "~55.0.15",
-    "expo-status-bar": "~55.0.5",
-    "expo-symbols": "~55.0.7",
-    "expo-system-ui": "~55.0.13",
-    "expo-web-browser": "~55.0.12",
-    "react": "19.2.0",
-    "react-dom": "19.2.0",
-    "react-native": "0.83.4",
-    "react-native-gesture-handler": "~2.30.0",
-    "react-native-google-mobile-ads": "^16.3.1",
-    "react-native-reanimated": "4.2.1",
-    "react-native-safe-area-context": "~5.6.2",
-    "react-native-screens": "~4.23.0",
-    "react-native-web": "~0.21.0",
-    "react-native-worklets": "0.7.2"
-  },
-  "devDependencies": {
-    "@types/react": "~19.2.2",
-    "typescript": "~5.9.2"
-  },
-  "private": true
+    "name": "expo-testbuild",
+    "main": "expo-router/entry",
+    "version": "1.0.0",
+    "scripts": {
+        "start": "expo start",
+        "android": "expo run:android",
+        "ios": "expo run:ios"
+    },
+    "dependencies": {
+        "@react-native-firebase/analytics": "^24.0.0",
+        "@react-native-firebase/auth": "^24.0.0",
+        "@react-native-firebase/crashlytics": "^24.0.0",
+        "@react-native-firebase/firestore": "^24.0.0",
+        "@react-native-firebase/messaging": "^24.0.0",
+        "@react-native-firebase/remote-config": "^24.0.0",
+        "@react-navigation/bottom-tabs": "^7.15.5",
+        "@react-navigation/elements": "^2.9.10",
+        "@react-navigation/native": "^7.1.33",
+        "expo": "~55.0.11",
+        "expo-build-properties": "~55.0.11",
+        "expo-constants": "~55.0.11",
+        "expo-dev-client": "~55.0.22",
+        "expo-device": "~55.0.12",
+        "expo-font": "~55.0.6",
+        "expo-glass-effect": "~55.0.10",
+        "expo-image": "~55.0.8",
+        "expo-linking": "~55.0.11",
+        "expo-router": "~55.0.10",
+        "expo-splash-screen": "~55.0.15",
+        "expo-status-bar": "~55.0.5",
+        "expo-symbols": "~55.0.7",
+        "expo-system-ui": "~55.0.13",
+        "expo-web-browser": "~55.0.12",
+        "react": "19.2.0",
+        "react-dom": "19.2.0",
+        "react-native": "0.83.4",
+        "react-native-gesture-handler": "~2.30.0",
+        "react-native-google-mobile-ads": "^16.3.1",
+        "react-native-reanimated": "4.2.1",
+        "react-native-safe-area-context": "~5.6.2",
+        "react-native-screens": "~4.23.0",
+        "react-native-web": "~0.21.0",
+        "react-native-worklets": "0.7.2"
+    },
+    "devDependencies": {
+        "@types/react": "~19.2.2",
+        "typescript": "~5.9.2"
+    },
+    "private": true
 }
 ```
 
@@ -461,21 +447,21 @@ end
 ```
 
 - **Platform that you're experiencing the issue on**:
-  - [x] iOS
-  - [ ] Android
-  - [ ] **iOS** but have not tested behavior on Android
-  - [ ] **Android** but have not tested behavior on iOS
-  - [ ] Both
+    - [x] iOS
+    - [ ] Android
+    - [ ] **iOS** but have not tested behavior on Android
+    - [ ] **Android** but have not tested behavior on iOS
+    - [ ] Both
 - **`react-native-firebase` version you're using that has this issue:**
-  - `24.0.0`
+    - `24.0.0`
 - **`Firebase` module(s) you're using that has the issue:**
-  - `app, analytics, auth, crashlytics, firestore, messaging, remote-config`
+    - `app, analytics, auth, crashlytics, firestore, messaging, remote-config`
 - **Are you using `TypeScript`?**
-  - `Y` & `5.9.2`
+    - `Y` & `5.9.2`
 
 </p>
 </details>
 
 ---
 
-- 👉 Check out [`React Native Firebase`](https://twitter.com/rnfirebase) and [`Invertase`](https://twitter.com/invertaseio) on Twitter for updates on the library.
+- 🔗 **Reproduction repository:** [AndreOleari015/expo-testbuild](https://github.com/AndreOleari015/expo-testbuild)
